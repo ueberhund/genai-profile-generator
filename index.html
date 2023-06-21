@@ -1,0 +1,34 @@
+<html>
+    <head>
+        <title>Stable Diffusion viewer</title>
+        <script src="https://sdk.amazonaws.com/js/aws-sdk-2.1190.0.min.js"></script>
+        <script src="./js/variables.js"></script>
+        <script src="./js/generator.js"></script>
+    </head>
+    <body>
+        <style>
+            body { font-family: Arial; padding: 5px; }
+            img { padding-top: 20px; padding-bottom: 15px; }
+        </style>
+        
+        <p>Stable Diffusion image generator</p>
+        <table>
+            <tr>
+                <td>Prompt:</td>
+                <td><input type="text" id="prompt" size="50" /></td>
+            </tr>
+            <tr>
+                <td>Negative prompt:</td>
+                <td><input type="text" id="negative_prompt" size="50" /></td>
+            </tr>
+            <tr>
+                <td>&nbsp;</td>
+                <td><button id="submit" onclick="generate_image()">Generate Image</button></td>
+            </tr>
+        </table>
+        
+        <div id="ImageSection">
+            <img id="GeneratedImage" />
+        </div>
+    </body>
+</html>

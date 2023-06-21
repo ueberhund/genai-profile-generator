@@ -1,0 +1,750 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template sets up the infrastructure for generative Ai with Stable Diffusion v2.1
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: The email address where you want to receive notifications
+    MinLength: 5
+    AllowedPattern: '[^\s@]+@[^\s@]+\.[^\s@]+'
+
+Resources:
+  #############################################################
+  # Resources required for S3 (bucket/encryption)
+  #############################################################        
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-policy
+        Statement:
+          - Sid: IAM user permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow key use
+            Effect: Allow 
+            Principal:
+              AWS: 
+                - !GetAtt StableDiffusionRole.Arn
+            Action: 
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+              - kms:CreateGrant
+              - kms:ListGrants
+            Resource: "*"
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: W35
+              reason: Solution is designed to be used by a small number of individuals; bucket logging not required
+            - id: W51
+              reason: Bucket policy is not needed for this application
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-sdv2.1"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true 
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: True
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref EncryptionKey
+              SSEAlgorithm: aws:kms
+              
+  ConfigureBucket:
+    Type: Custom::DeployWebsite
+    Properties:
+      ServiceToken: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaConfigureBucket}
+      Bucket: !Ref Bucket 
+      
+  LambdaConfigureBucket:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: W58
+              reason: W58 is a false positive, as Lambda can write to CloudWatch Logs via its role
+            - id: W89
+              reason: This Lambda does not need to be part of a VPC, since it does not access VPC resources
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              
+              bucket = event["ResourceProperties"]["Bucket"]
+              responseData = {}
+              
+              if event['RequestType'] == 'Create':
+                try:                 
+                  
+                  directory_name1 = "input/images/"
+                  directory_name2 = "output/"
+                  
+                  s3 = boto3.client('s3')
+                  
+                  s3.put_object(Bucket=bucket, Key=(directory_name1), ServerSideEncryption="aws:kms")
+                  s3.put_object(Bucket=bucket, Key=(directory_name2), ServerSideEncryption="aws:kms")
+                  
+                except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+        
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt LambdaConfigureBucketRole.Arn
+      
+  LambdaConfigureBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-s3access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:PutObject
+                Resource: !Sub ${Bucket.Arn}/*
+
+  #############################################################
+  # Resources required for the step function
+  #############################################################                      
+  AlertTopic: 
+    Type: AWS::SNS::Topic
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: W47
+              reason: KMS not needed on this topic, as nothing sensitive will be stored
+    Properties: 
+      Subscription: 
+        - Endpoint: !Ref EmailAddress
+          Protocol: "email"
+          
+  ModelName: 
+    Type: AWS::SSM::Parameter
+    Properties:
+         Type: String
+         Value: <PLACEHOLDER FOR ENDPOINT NAME>
+          
+  TrainSDv21Model:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StableDiffusionRole.Arn
+      DefinitionString: 
+        !Sub |- 
+            {
+              "Comment": "State machine to train a stable diffusion v2.1 model on your personalized images",
+              "StartAt": "SageMaker CreateTrainingJob",
+              "States": {
+                "SageMaker CreateTrainingJob": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createTrainingJob",
+                  "Parameters": {
+                    "AlgorithmSpecification": {
+                      "EnableSageMakerMetricsTimeSeries": false,
+                      "MetricDefinitions": [
+                        {
+                          "Name": "fid_score",
+                          "Regex": "fid_score=([-+]?\\d\\.?\\d*)"
+                        },
+                        {
+                          "Name": "ObjectiveMetric",
+                          "Regex": "fid_score=([-+]?\\d\\.?\\d*)"
+                        }
+                      ],
+                      "TrainingImage": "763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-training:1.10.2-transformers4.17.0-gpu-py38-cu113-ubuntu20.04",
+                      "TrainingInputMode": "File"
+                    },
+                    "EnableInterContainerTrafficEncryption": false,
+                    "EnableManagedSpotTraining": false,
+                    "EnableNetworkIsolation": false,
+                    "HyperParameters": {
+                      "batch_size": "1",
+                      "sagemaker_program": "transfer_learning.py",
+                      "max_steps": "500",
+                      "seed": "0",
+                      "_tuning_objective_metric": "fid_score",
+                      "adam_beta1": "0.9",
+                      "sagemaker_region": "${AWS::Region}",
+                      "adam_beta2": "0.999",
+                      "num_class_images": "100",
+                      "sagemaker_submit_directory": "s3://jumpstart-cache-prod-us-east-1/source-directory-tarballs/stabilityai/transfer_learning/txt2img/prepack/v1.0.3/sourcedir.tar.gz",
+                      "compute_fid": "True",
+                      "gradient_accumulation_steps": "1",
+                      "prior_loss_weight": "1.0",
+                      "sagemaker_container_log_level": "20",
+                      "lr_scheduler": "constant",
+                      "center_crop": "False",
+                      "adam_weight_decay": "0.01",
+                      "with_prior_preservation": "False",
+                      "adam_epsilon": "1e-08",
+                      "sagemaker_job_name.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)",
+                      "epochs": "20",
+                      "learning_rate": "2.1851077822131335e-06",
+                      "max_grad_norm": "1.0"
+                    },
+                    "InputDataConfig": [
+                      {
+                        "ChannelName": "training",
+                        "DataSource": {
+                          "S3DataSource": {
+                            "S3DataDistributionType": "FullyReplicated",
+                            "S3DataType": "S3Prefix",
+                            "S3Uri": "s3://${Bucket}/input/images/"
+                          }
+                        }
+                      },
+                      {
+                        "ChannelName": "model",
+                        "DataSource": {
+                          "S3DataSource": {
+                            "S3DataType": "S3Prefix",
+                            "S3Uri": "s3://jumpstart-cache-prod-us-east-1/stabilityai-training/train-model-txt2img-stabilityai-stable-diffusion-v2-1-base.tar.gz",
+                            "S3DataDistributionType": "FullyReplicated"
+                          }
+                        },
+                        "ContentType": "application/x-sagemaker-model",
+                        "InputMode": "File"
+                      }
+                    ],
+                    "OutputDataConfig": {
+                      "KmsKeyId": "${EncryptionKey}",
+                      "S3OutputPath": "s3://${Bucket}/output/"
+                    },
+                    "ResourceConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.g4dn.8xlarge",
+                      "VolumeSizeInGB": 30
+                    },
+                    "RoleArn": "${StableDiffusionRole.Arn}",
+                    "StoppingCondition": {
+                      "MaxRuntimeInSeconds": 360000
+                    },
+                    "TrainingJobName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)"
+                  },
+                  "Next": "SageMaker DescribeTrainingJob",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "SNS Publish Error"
+                    }
+                  ]
+                },
+                "SageMaker DescribeTrainingJob": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeTrainingJob",
+                  "Parameters": {
+                    "TrainingJobName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)"
+                  },
+                  "ResultPath": "$.StepResult",
+                  "Next": "Choice1"
+                },
+                "Choice1": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.StepResult.TrainingJobStatus",
+                      "StringEquals": "Completed",
+                      "Next": "SageMaker CreateModel"
+                    },
+                    {
+                      "Variable": "$.StepResult.TrainingJobStatus",
+                      "StringEquals": "InProgress",
+                      "Next": "Wait1"
+                    }
+                  ],
+                  "Default": "SNS Publish Error"
+                },
+                "Wait1": {
+                  "Type": "Wait",
+                  "Seconds": 60,
+                  "Next": "SageMaker DescribeTrainingJob"
+                },
+                "SNS Publish Error": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",
+                  "Parameters": {
+                    "Message.$": "$",
+                    "TopicArn": "${AlertTopic}"
+                  },
+                  "End": true
+                },
+                "SageMaker CreateModel": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createModel",
+                  "Parameters": {
+                    "EnableNetworkIsolation": false,
+                    "ExecutionRoleArn": "${StableDiffusionRole.Arn}",
+                    "ModelName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)",
+                    "PrimaryContainer": {
+                      "Image": "763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:1.10.2-transformers4.17.0-gpu-py38-cu113-ubuntu20.04",
+                      "ModelDataUrl.$": "$.StepResult.ModelArtifacts.S3ModelArtifacts"
+                    }
+                  },
+                  "Next": "SageMaker CreateEndpointConfig",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "SNS Publish Error"
+                    }
+                  ]
+                },
+                "SageMaker CreateEndpointConfig": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+                  "Parameters": {
+                    "EndpointConfigName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)",
+                    "ProductionVariants": [
+                      {
+                        "InitialInstanceCount": 1,
+                        "InitialVariantWeight": 1,
+                        "InstanceType": "ml.p3.2xlarge",
+                        "VariantName": "AllTraffic",
+                        "ModelName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)"
+                      }
+                    ]
+                  },
+                  "Next": "SageMaker CreateEndpoint",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "SNS Publish Error"
+                    }
+                  ]
+                },
+                "SageMaker CreateEndpoint": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+                  "Parameters": {
+                    "EndpointConfigName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)",
+                    "EndpointName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)"
+                  },
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "SNS Publish Error"
+                    }
+                  ],
+                  "Next": "DescribeEndpoint"
+                },
+                "DescribeEndpoint": {
+                  "Type": "Task",
+                  "Next": "Choice2",
+                  "Parameters": {
+                    "EndpointName.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)"
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeEndpoint"
+                },
+                "Choice2": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.EndpointStatus",
+                      "StringEquals": "InService",
+                      "Next": "PutParameter"
+                    },
+                    {
+                      "Variable": "$.EndpointStatus",
+                      "StringEquals": "Creating",
+                      "Next": "Wait2"
+                    }
+                  ],
+                  "Default": "SNS Publish Error"
+                },
+                "PutParameter": {
+                  "Type": "Task",
+                  "Next": "SNS Publish Success",
+                  "Parameters": {
+                    "Name": "${ModelName}",
+                    "Value.$": "States.Format('${AWS::StackName}-{}', $$.Execution.Name)",
+                    "Overwrite": true
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:ssm:putParameter"
+                },
+                "Wait2": {
+                  "Type": "Wait",
+                  "Seconds": 60,
+                  "Next": "DescribeEndpoint"
+                },
+                "SNS Publish Success": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",
+                  "Parameters": {
+                    "Message.$": "States.Format('The stable diffusion v2 model was successfully deployed. The endpoint name is ${AWS::StackName}-{}.', $$.Execution.Name)",
+                    "TopicArn": "${AlertTopic}"
+                  },
+                  "End": true
+                }
+              }
+            }
+            
+  StableDiffusionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: F38
+              reason: iam:PassRole is required because this is being accessed via an AWS Step Function
+            - id: W11
+              reason: Ignoring * permissions with SageMaker
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - states.amazonaws.com
+                - sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-sagemaker
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:AddTags
+                  - iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                  - kms:ListGrants
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish 
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:Describe*
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - s3:ListBucket
+                Resource:                   
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-sdv2.1"
+                  - arn:aws:s3:::jumpstart-cache-prod-us-east-1
+              - Effect: Allow
+                Action: 
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:                   
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-sdv2.1/*"
+                  - arn:aws:s3:::jumpstart-cache-prod-us-east-1/*
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter 
+                  - ssm:PutParameter 
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+                  
+  #############################################################
+  # Resources required to delete the model upon stack deletion
+  #############################################################        
+  ConfigureModels:
+    Type: Custom::ConfigureMLModels
+    Properties:
+      ServiceToken: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaConfigureMLModels}
+      Bucket: !Ref Bucket 
+      
+  LambdaConfigureMLModels:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: W58
+              reason: W58 is a false positive, as Lambda can write to CloudWatch Logs via its role
+            - id: W89
+              reason: This Lambda does not need to be part of a VPC, since it does not access VPC resources
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              
+              responseData = {}
+              model_prefix = "${AWS::StackName}"
+              
+              if event['RequestType'] == 'Create':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              elif event['RequestType'] == 'Delete':
+                try:
+                  client = boto3.client("sagemaker")
+
+                  response = client.list_endpoints()
+                  for endpoint in response["Endpoints"]:
+                      if endpoint["EndpointName"].startswith(model_prefix):
+                          client.delete_endpoint(EndpointName=endpoint["EndpointName"])
+                          
+                  response = client.list_endpoint_configs()
+                  for endpoint in response["EndpointConfigs"]:
+                      if endpoint["EndpointConfigName"].startswith(model_prefix):
+                          client.delete_endpoint_config(EndpointConfigName=endpoint["EndpointConfigName"])
+                          
+                  response = client.list_models()
+                  for model in response["Models"]:
+                      if model["ModelName"].startswith(model_prefix):
+                          client.delete_model(ModelName=model["ModelName"])
+                except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                  
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+        
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt LambdaConfigureMLModelsRole.Arn
+      
+  LambdaConfigureMLModelsRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Star is required for the List* permissions
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-sagemakeraccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sagemaker:ListEndpoints
+                  - sagemaker:ListEndpointConfigs
+                  - sagemaker:ListModels
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                Resource:
+                  - !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/*
+                  - !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*
+                  - !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model/*
+                
+
+  #############################################################
+  # Resources required to access sagemaker runtime via a website
+  #############################################################        
+  LambdaInvokeEndpoint:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+          rules_to_suppress:
+            - id: W58
+              reason: W58 is a false positive, as Lambda can write to CloudWatch Logs via its role
+            - id: W89
+              reason: This Lambda does not need to be part of a VPC, since it does not access VPC resources
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3 
+          from PIL import Image
+          import numpy as np
+          import base64
+          from io import BytesIO
+
+          def lambda_handler(event, context):
+              prompt = ""
+              negative_prompt = ""
+              payload = ""
+              
+              if "prompt" in event['queryStringParameters']:
+                  prompt = event['queryStringParameters']['prompt']
+              
+              if "negative_prompt" in event['queryStringParameters']:
+                  negative_prompt = event['queryStringParameters']['negative_prompt']
+
+              if len(negative_prompt) > 0:
+                  payload = {
+                      "prompt": prompt, 
+                      "negative_prompt": negative_prompt,
+                      "width": 512,
+                      "height": 512,
+                      "num_images_per_prompt": 1,
+                      "num_inference_steps": 60,
+                      "guidance_scale": 7,
+                      "seed": 1
+                  }
+              else: 
+                  payload = {
+                      "prompt": prompt, 
+                      "width": 512,
+                      "height": 512,
+                      "num_images_per_prompt": 1,
+                      "num_inference_steps": 60,
+                      "guidance_scale": 7,
+                      "seed": 1
+                  }
+                  
+              ssm_client = boto3.client('ssm')
+              ssm_response = ssm_client.get_parameter(Name='${ModelName}')
+              endpoint_name = ssm_response['Parameter']['Value']
+              
+              client = boto3.client('sagemaker-runtime')
+              response = client.invoke_endpoint(
+                  EndpointName=endpoint_name,
+                  Body=json.dumps(payload).encode("utf-8"),
+                  Accept='application/json',
+                  ContentType='application/json'
+              )
+              
+              responsedata = json.loads(response['Body'].read())
+              
+              for img in responsedata['generated_images']:
+                  new_image = Image.fromarray(np.array(img).astype('uint8'))
+                  
+                  img_file = BytesIO()
+                  new_image.save(img_file, format="PNG")
+                  img_bytes = img_file.getvalue()
+                  img_64 = base64.b64encode(img_bytes)
+                  
+                  return {
+                      'statusCode': 200,
+                      'isBase64Encoded': True,
+                      'body': img_64
+                  }
+                  
+              return {
+                  'statusCode': 200,
+                  'body': ''
+              }
+
+        
+      Handler: "index.lambda_handler"
+      Runtime: python3.10
+      Timeout: 60
+      Layers:
+        # from https://api.klayers.cloud/api/v2/p3.10/layers/latest/us-east-1/html
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p310-Pillow:2
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p310-numpy:1
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt LambdaInvokeEndpointRole.Arn
+      
+  LambdaInvokeEndpointRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-sagemaker
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sagemaker:InvokeEndpoint
+                Resource: !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter 
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+                  
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      ProtocolType: HTTP
+      RouteKey: ANY /
+      Target: !GetAtt LambdaInvokeEndpoint.Arn  
+  
+  HttpApiPermissionForLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction 
+      FunctionName: !GetAtt LambdaInvokeEndpoint.Arn 
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*"
+      
+  
+Outputs:
+  S3Bucket:
+    Value: !Ref Bucket
+  StepFunction:
+    Value: !GetAtt TrainSDv21Model.Name
+  ApiEndpoint:
+    Value: !GetAtt HttpApi.ApiEndpoint
